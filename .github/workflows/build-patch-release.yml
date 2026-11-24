@@ -1,0 +1,166 @@
+name: Build Modpack Patch Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      pack_id:
+        description: 'Modpack ID'
+        required: true
+        type: string
+      version:
+        description: 'New version string'
+        required: true
+        type: string
+      title:
+        description: 'Release title'
+        required: true
+        type: string
+      description:
+        description: 'Release description'
+        required: false
+        default: ''
+        type: string
+      minecraft_version:
+        description: 'Minecraft version'
+        required: false
+        default: '1.21.1'
+        type: string
+      loader:
+        description: 'Mod loader'
+        required: false
+        default: 'fabric'
+        type: string
+      loader_version:
+        description: 'Mod loader version'
+        required: false
+        default: ''
+        type: string
+      base_repo:
+        description: 'Repository hosting the base release (defaults to current repo)'
+        required: false
+        default: ''
+        type: string
+      base_tag:
+        description: 'Base release tag to download full ZIP from'
+        required: true
+        type: string
+      patch_tag:
+        description: 'Temporary staging release tag with patch.zip and removed.json'
+        required: true
+        type: string
+      job_id:
+        description: 'Correlation job ID'
+        required: true
+        type: string
+
+run-name: "Build Patch ${{ inputs.pack_id }} v${{ inputs.version }} [${{ inputs.job_id }}]"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Download base release and patch staging assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dl_base dl_patch work_pack
+          BASE_REPO="${{ inputs.base_repo }}"
+          if [ -z "$BASE_REPO" ]; then
+            BASE_REPO="${{ github.repository }}"
+          fi
+          gh release download "${{ inputs.base_tag }}" --repo "$BASE_REPO" --pattern "*.zip" --dir ./dl_base
+          gh release download "${{ inputs.patch_tag }}" --repo "${{ github.repository }}" --dir ./dl_patch
+
+      - name: Apply patch and removals onto base modpack
+        run: |
+          node - <<'EOF'
+          const fs = require('fs')
+          const path = require('path')
+          const { execFileSync } = require('child_process')
+
+          const baseZips = fs.readdirSync('./dl_base').filter((f) => f.endsWith('.zip'))
+          if (baseZips.length === 0) {
+            throw new Error('No base .zip found in base release')
+          }
+          const baseZipPath = path.join('./dl_base', baseZips[0])
+          execFileSync('unzip', ['-q', baseZipPath, '-d', './work_pack'], { stdio: 'inherit' })
+
+          // Flatten single non-standard wrapper folder if present
+          const STANDARD_TOP = new Set([
+            'mods', 'config', 'defaultconfigs', 'resourcepacks', 'shaderpacks',
+            'kubejs', 'datapacks', 'scripts', 'saves', 'screenshots',
+            'logs', 'crash-reports', 'backups', 'xaerowaypoints',
+            'xaeroworldmap', 'schematics', 'replay_recordings', 'replay_videos', '.dr3sh',
+          ])
+          const topEntries = fs.readdirSync('./work_pack', { withFileTypes: true })
+          if (topEntries.length === 1 && topEntries[0].isDirectory() && !STANDARD_TOP.has(topEntries[0].name.toLowerCase())) {
+            const wrapperDir = path.join('./work_pack', topEntries[0].name)
+            for (const child of fs.readdirSync(wrapperDir)) {
+              fs.renameSync(path.join(wrapperDir, child), path.join('./work_pack', child))
+            }
+            fs.rmdirSync(wrapperDir)
+          }
+
+          // Remove deleted files listed in removed.json
+          const removedJsonPath = './dl_patch/removed.json'
+          if (fs.existsSync(removedJsonPath)) {
+            const removed = JSON.parse(fs.readFileSync(removedJsonPath, 'utf8'))
+            if (Array.isArray(removed)) {
+              for (const rel of removed) {
+                const norm = String(rel || '').replace(/\\/g, '/').replace(/^\/+/, '')
+                if (!norm || norm.includes('..') || norm.includes(':')) continue
+                const target = path.resolve('./work_pack', norm)
+                const root = path.resolve('./work_pack')
+                if (!target.startsWith(root + path.sep)) continue
+                if (fs.existsSync(target)) {
+                  fs.rmSync(target, { recursive: true, force: true })
+                }
+              }
+            }
+          }
+
+          // Overlay changed/added files from patch.zip
+          const patchZipPath = './dl_patch/patch.zip'
+          if (fs.existsSync(patchZipPath) && fs.statSync(patchZipPath).size > 22) {
+            execFileSync('unzip', ['-q', '-o', patchZipPath, '-d', './work_pack'], { stdio: 'inherit' })
+          }
+          EOF
+
+      - name: Build and publish full release + manifest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ARGS=(
+            --pack "${{ inputs.pack_id }}"
+            --version "${{ inputs.version }}"
+            --src "./work_pack"
+            --repo "${{ github.repository }}"
+            --mc "${{ inputs.minecraft_version }}"
+            --loader "${{ inputs.loader }}"
+            --title "${{ inputs.title }}"
+          )
+          if [ -n "${{ inputs.loader_version }}" ]; then
+            ARGS+=(--loader-version "${{ inputs.loader_version }}")
+          fi
+          if [ -n "${{ inputs.description }}" ]; then
+            ARGS+=(--description "${{ inputs.description }}")
+          fi
+          node .github/scripts/publish_modpack.cjs "${ARGS[@]}"
+
+      - name: Cleanup staging patch release
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "${{ inputs.patch_tag }}" --repo "${{ github.repository }}" --cleanup-tag -y || true
