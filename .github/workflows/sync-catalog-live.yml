@@ -1,0 +1,16 @@
+name: Sync catalog-live release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download versions.json and upload to Dr3sh/modpack-versions catalog-live
+        env:
+          GH_TOKEN: ${{ secrets.CATALOG_SYNC_TOKEN }}
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/Dr3sh/modpack-versions/main/versions.json?t=$(date +%s)" -o versions.json
+          node -e "JSON.parse(require('fs').readFileSync('versions.json','utf8'))"
+          gh release upload catalog-live versions.json --repo Dr3sh/modpack-versions --clobber
